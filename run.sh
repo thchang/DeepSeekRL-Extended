@@ -1,0 +1,1 @@
+python main.py --output_dir "9_run" --verbose
