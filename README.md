@@ -4,7 +4,7 @@
 ## Motivation
 I wanted to recreate DeepSeek R1's  results at a smaller scale, focusing on understanding the core mechanics by implementing everything from scratch. So this is a repo that trains Qwen1.5B on the [grade school math dataset](https://github.com/openai/grade-school-math).
 
-This implementation heavily borrows from [Will Brown's excellent work](https://gist.github.com/willccbb/4676755236bb08cab5f4e54a0475d6fb) ([@willccbb](https://x.com/willccbb)), but restructures the code into a format optimized for learning and experimentation.
+This implementation heavily borrows from [Will Brown's  work](https://gist.github.com/willccbb/4676755236bb08cab5f4e54a0475d6fb) ([@willccbb](https://x.com/willccbb)), but restructures the code into a format optimized for learning and experimentation.
 
 The key difference in my implementation is computing the GRPO loss function directly rather than using external RL libraries, and reformatting into a multi script repo.
 
@@ -38,7 +38,7 @@ Contains evaluation metrics and reward functions, closely following DeepSeek's o
 ## Results
 Training was conducted on a single H100 GPU. After [X] training steps:
 
-[TODO: Insert training curve/results image]
+![Training Results](training_score.png)
 
 ## Future Directions
 Having successfully recreated the core DeepSeek R1 training process, I'm really pleased to see how well the key mechanics work even in this simplified implementation. Rl just works (TM). Building on this, I am very excited about several directions:
