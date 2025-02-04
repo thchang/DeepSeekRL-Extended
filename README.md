@@ -41,7 +41,9 @@ Training was conducted on a single H100 GPU. After [X] training steps:
 ![Training Results](training_score.png)
 
 ## Future Directions
-Having successfully recreated the core DeepSeek R1 training process, I'm really pleased to see how well the key mechanics work even in this simplified implementation. Rl just works (TM). Building on this, I am very excited about several directions:
+I'm really pleased to see how well the key mechanics work even in this simplified implementation. Rl just works (TM). Building on this, I am very excited about several directions:
+
+0. (I wrote that previous line too early) - I do see signs of learning, but its not quite yet working yet. I want to better replicate the results.
 
 1. Adding self-play capabilities where agents compete and learn from each other using relative rewards. This would create a more dynamic training environment where the reward signal comes from agent interactions rather than fixed metrics.
 
