@@ -9,6 +9,15 @@ from datasets import load_dataset, Dataset
 from abc import ABC, abstractmethod
 from typing import Tuple, Any
 
+SYSTEM_PROMPT = """
+Respond in the following format:
+<reasoning>
+...
+</reasoning>
+<answer>
+...
+</answer>
+"""
 
 
 class DataLoader(ABC):
@@ -70,9 +79,9 @@ class GSM8KLoader(DataLoader):
         self.questions = questions
         self.answers = answers
         self.pre_prompt = """You will be given a question that involves reasoning. You should reason carefully about the question, then provide your answer.
-
             It is very important that you put your reasoning process inside <reasoning> tags and your final answer inside <answer> tags, like this:
 
+            
             <reasoning>
             Your step-by-step reasoning process here
             </reasoning>
@@ -80,9 +89,11 @@ class GSM8KLoader(DataLoader):
             Your final answer here
             </answer>
 
+            All of your returned text should either be in the <reasoning> or <answer> tags - no text outside! Start each answer by immediately starting with <reasoning>. 
             It is is extremely important you answer in this way - do not put any information or text outside of these tags!
 
             Question: """
+        self.system_prompt = SYSTEM_PROMPT
         
     def __len__(self) -> int:
         return len(self.questions)

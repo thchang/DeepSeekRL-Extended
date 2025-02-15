@@ -1,1 +1,1 @@
-python main.py --output_dir "9_run" --verbose
+python main.py --output_dir "testing129" --verbose
