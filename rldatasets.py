@@ -2,6 +2,7 @@
 Hold all data sets 
 
 """
+
 import random
 import numpy as np
 from tqdm import tqdm
@@ -9,15 +10,6 @@ from datasets import load_dataset, Dataset
 from abc import ABC, abstractmethod
 from typing import Tuple, Any
 
-SYSTEM_PROMPT = """
-Respond in the following format:
-<reasoning>
-...
-</reasoning>
-<answer>
-...
-</answer>
-"""
 
 
 class DataLoader(ABC):
@@ -57,6 +49,19 @@ def extract_hash_answer(text: str) -> str | None:
     if "####" not in text:
         return None
     return text.split("####")[1].strip()
+
+
+
+SYSTEM_PROMPT = """
+Respond in the following format:
+<reasoning>
+...
+</reasoning>
+<answer>
+...
+</answer>
+"""
+
 
 
 class GSM8KLoader(DataLoader):

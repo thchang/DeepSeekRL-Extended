@@ -1,17 +1,24 @@
 """
-Hold all LLMs 
-
-Make it easier to expland to
-
-I envision expanding this to many types of model - even GPT model as evaluatiors 
-So want to keep it here 
+Module for loading LLMs and their tokenizers from huggingface. 
 
 """
 import torch
-from transformers import AutoTokenizer, AutoModelForCausalLM
+from transformers import AutoTokenizer, AutoModelForCausalLM, PreTrainedModel, PreTrainedTokenizerBase
 
 
-def get_llm_tokenizer(model_name, device): 
+def get_llm_tokenizer(model_name: str, device: str) -> tuple[PreTrainedModel, PreTrainedTokenizerBase]:
+    """
+    Load and configure a language model and its tokenizer.
+
+    Args:
+        model_name: Name or path of the pretrained model to load
+        device: Device to load the model on ('cpu' or 'cuda')
+
+    Returns:
+        tuple containing:
+            - The loaded language model
+            - The configured tokenizer for that model
+    """
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
         torch_dtype=torch.bfloat16,
@@ -21,8 +28,6 @@ def get_llm_tokenizer(model_name, device):
     
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     tokenizer.pad_token = tokenizer.eos_token
-    # Add this line to ensure model's config matches tokenizer
     model.config.pad_token_id = tokenizer.pad_token_id
     
     return model, tokenizer
-

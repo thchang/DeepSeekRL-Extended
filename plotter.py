@@ -1,8 +1,9 @@
-import json
 import os
+import json
+import argparse
+import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.style as style
-import numpy as np
 from matplotlib.backends.backend_pdf import PdfPages
 
 def moving_average(data, window_size=5):
@@ -20,6 +21,15 @@ def plot_metrics(output_dir):
     train_logs_path = os.path.join(output_dir, 'training_logs', 'train_logs.json')
     with open(train_logs_path, 'r') as f:
         train_logs = json.load(f)
+
+    # Load evaluation logs
+    eval_logs = {}
+    eval_logs_dir = os.path.join(output_dir, 'eval_logs')
+    for filename in os.listdir(eval_logs_dir):
+        if filename.startswith('metrics_') and filename.endswith('.json'):
+            step = int(filename.split('_')[1].split('.')[0])
+            with open(os.path.join(eval_logs_dir, filename), 'r') as f:
+                eval_logs[step] = json.load(f)
 
     # Set style and color palette
     plt.style.use('bmh')  # Using 'bmh' style which is a modern, clean style
@@ -130,5 +140,38 @@ def plot_metrics(output_dir):
         pdf.savefig(bbox_inches='tight')
         plt.close()
 
+        # Plot evaluation metrics
+        if eval_logs:
+            eval_steps = sorted(eval_logs.keys())
+            
+            # Plot accuracy
+            plt.figure(figsize=(12,7))
+            accuracy_values = [eval_logs[step]['accuracy'] for step in eval_steps]
+            plt.plot(eval_steps, accuracy_values, color='#2ecc71', linewidth=2.0, label='Accuracy')
+            plt.xlabel('Training Steps', fontsize=12)
+            plt.ylabel('Accuracy (%)', fontsize=12)
+            plt.title('Evaluation Accuracy', fontsize=14, pad=20)
+            plt.grid(True, alpha=0.3)
+            plt.legend()
+            pdf.savefig(bbox_inches='tight')
+            plt.close()
+
+            # Plot evaluation reward metrics
+            eval_metrics = [key for key in eval_logs[eval_steps[0]]['metrics'].keys()]
+            for metric, color in zip(eval_metrics, colors):
+                plt.figure(figsize=(12,7))
+                metric_values = [eval_logs[step]['metrics'][metric] for step in eval_steps]
+                plt.plot(eval_steps, metric_values, color=color, linewidth=2.0, label=metric)
+                plt.xlabel('Training Steps', fontsize=12)
+                plt.ylabel(metric.replace('_', ' ').title(), fontsize=12)
+                plt.title(f'Evaluation {metric.replace("_", " ").title()}', fontsize=14, pad=20)
+                plt.grid(True, alpha=0.3)
+                plt.legend()
+                pdf.savefig(bbox_inches='tight')
+                plt.close()
+
 if __name__ == "__main__":
-    plot_metrics("nodivide")
+    parser = argparse.ArgumentParser(description='Plot training metrics from logs directory')
+    parser.add_argument('--log_dir', type=str, help='Directory containing training logs')
+    args = parser.parse_args()
+    plot_metrics(args.log_dir)

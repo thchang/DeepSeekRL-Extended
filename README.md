@@ -8,6 +8,8 @@ This implementation heavily borrows from [Will Brown's  work](https://gist.githu
 
 The key difference in my implementation is computing the GRPO loss function directly rather than using external RL libraries, and reformatting into a multi script repo.
 
+I hope this might help other people understand things better, and maybe provide an easier way to try out smaller scale ideas etc. 
+
 ## Installation
 ```
 pip install -r requirements.txt
@@ -36,20 +38,21 @@ Handles dataset loading and preprocessing, currently focused on GSM8K math probl
 Contains evaluation metrics and reward functions, closely following DeepSeek's original implementation.
 
 ## Results
-Training was conducted on a single H100 GPU. After [X] training steps:
+Training was conducted on a single H100 GPU. After ~400 training steps:
 
-![Training Results](training_score.png)
+![Training Results](plots/train_score.png)
+
+And results on the validation set - this shows a clearer sign of learning: 
+![Eval Results](plots/eval_score.png)
 
 ## Future Directions
-I'm really pleased to see how well the key mechanics work even in this simplified implementation. Rl just works (TM). Building on this, I am very excited about several directions:
-
-0. (I wrote that previous line too early) - I do see signs of learning, but its not quite yet working yet. I want to better replicate the results.
+I'm really pleased to see how well the key mechanics work even in this simplified implementation. Building on this, I am very excited about several directions:
 
 1. Adding self-play capabilities where agents compete and learn from each other using relative rewards. This would create a more dynamic training environment where the reward signal comes from agent interactions rather than fixed metrics.
 
-2. Implementing soft reward structures, particularly for complex reasoning tasks. I've developed a framework for AI debate that I'm eager to integrate - while it hasn't worked yet, I believe the clean implementation here provides a great foundation for experimenting with these nuanced reward signals.
+2. Implementing soft reward structures, particularly for complex reasoning tasks. I've writing a framework for AI debate that I'm excited to try out.
 
-3. Expanding into vision-language models (VLMs) to improve world modeling capabilities. I have a novel idea about using R1-style training to enhance how VLMs build and maintain internal world models that I'm really excited to explore. (Really excited about this idea - if anyone else is interested I would love to talk.)
+3. Expanding into vision-language models (VLMs) to improve world modeling capabilities. I have an idea about using R1-style training to enhance how VLMs build and maintain internal world models that I'm really excited to explore. (Really excited about this idea - if anyone else is interested I would love to talk.)
 
 4. I'd like to do all this experimentation in this framework, so I need to make things faster, and support multi-gpu training.
 
