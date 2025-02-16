@@ -4,6 +4,8 @@ Hold all kinds of evaluation criteria, right now just for gsmk8k
 import re
 
 
+NUMBER_OF_FUNCTIONS = 5
+
 def extract_xml_answer(text: str) -> str:
     answer = text.split("<answer>")[-1]
     answer = answer.split("</answer>")[0]

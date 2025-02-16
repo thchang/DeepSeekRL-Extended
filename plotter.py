@@ -29,12 +29,17 @@ def plot_metrics(output_dir):
     pdf_path = os.path.join(output_dir, 'training_plots.pdf')
     with PdfPages(pdf_path) as pdf:
         
-        # Get all metric names from first entry
-        first_step = list(train_logs.keys())[0]
-        metric_names = list(train_logs[first_step].keys())
+        # Plot reward metrics
+        reward_metrics = [
+            'rewards/correctness_reward_func',
+            'rewards/int_reward_func', 
+            'rewards/strict_format_reward_func',
+            'rewards/soft_format_reward_func',
+            'rewards/xmlcount_reward_func',
+            'reward'
+        ]
         
-        # Plot main metrics
-        for metric, color in zip(metric_names, colors):
+        for metric, color in zip(reward_metrics, colors):
             plt.figure(figsize=(12,7))
             steps = [int(x) for x in train_logs.keys()]
             values = [metrics[metric] for metrics in train_logs.values()]
@@ -49,49 +54,81 @@ def plot_metrics(output_dir):
                 plt.plot(ma_steps, ma_values, color=color, linewidth=2.5, label='Moving average')
             
             plt.xlabel('Training Steps', fontsize=12)
-            plt.ylabel(f'{metric.replace("_", " ").title()}', fontsize=12)
-            plt.title(f'Training {metric.replace("_", " ").title()}', fontsize=14, pad=20)
+            plt.ylabel(f'{metric.split("/")[-1].replace("_", " ").title()}', fontsize=12)
+            plt.title(f'{metric.split("/")[-1].replace("_", " ").title()}', fontsize=14, pad=20)
             plt.grid(True, alpha=0.3)
             plt.legend()
             pdf.savefig(bbox_inches='tight')
             plt.close()
 
-        # Plot total loss
+        # Plot learning rate
         plt.figure(figsize=(12,7))
         steps = [int(x) for x in train_logs.keys()]
-        total_loss = [metrics['total_loss'] for metrics in train_logs.values()]
+        lr_values = [metrics['learning_rate'] for metrics in train_logs.values()]
 
-        plt.plot(steps, total_loss, color='#e74c3c', alpha=0.3, linewidth=1.5, label='Total Loss (Raw)')
-        if len(total_loss) > 5:
-            ma_total_loss = moving_average(total_loss)
-            ma_steps = steps[len(steps)-len(ma_total_loss):]
-            plt.plot(ma_steps, ma_total_loss, color='#e74c3c', linewidth=2.5, label='Total Loss (MA)')
-
+        plt.plot(steps, lr_values, color='#e74c3c', linewidth=2.0, label='Learning Rate')
+        
         plt.xlabel('Training Steps', fontsize=12)
-        plt.ylabel('Loss Value', fontsize=12)
-        plt.title('Total Loss', fontsize=14, pad=20)
+        plt.ylabel('Learning Rate', fontsize=12)
+        plt.title('Learning Rate Schedule', fontsize=14, pad=20)
         plt.grid(True, alpha=0.3)
         plt.legend()
         pdf.savefig(bbox_inches='tight')
         plt.close()
 
-        # Plot KL loss separately
+        # Plot reward standard deviation
         plt.figure(figsize=(12,7))
-        kl_loss = [metrics['mean_kl_loss'] for metrics in train_logs.values()]
+        reward_std = [metrics['reward_std'] for metrics in train_logs.values()]
 
-        plt.plot(steps, kl_loss, color='#3498db', alpha=0.3, linewidth=1.5, label='KL Loss (Raw)')
-        if len(kl_loss) > 5:
-            ma_kl_loss = moving_average(kl_loss)
-            ma_steps = steps[len(steps)-len(ma_kl_loss):]
-            plt.plot(ma_steps, ma_kl_loss, color='#3498db', linewidth=2.5, label='KL Loss (MA)')
+        plt.plot(steps, reward_std, color='#3498db', alpha=0.3, linewidth=1.5, label='Reward Std (Raw)')
+        if len(reward_std) > 5:
+            ma_std = moving_average(reward_std)
+            ma_steps = steps[len(steps)-len(ma_std):]
+            plt.plot(ma_steps, ma_std, color='#3498db', linewidth=2.5, label='Reward Std (MA)')
 
         plt.xlabel('Training Steps', fontsize=12)
-        plt.ylabel('Loss Value', fontsize=12)
-        plt.title('KL Loss', fontsize=14, pad=20)
+        plt.ylabel('Standard Deviation', fontsize=12)
+        plt.title('Reward Standard Deviation', fontsize=14, pad=20)
+        plt.grid(True, alpha=0.3)
+        plt.legend()
+        pdf.savefig(bbox_inches='tight')
+        plt.close()
+
+        # Plot loss
+        plt.figure(figsize=(12,7))
+        loss_values = [metrics['loss'] for metrics in train_logs.values()]
+
+        plt.plot(steps, loss_values, color='#e67e22', alpha=0.3, linewidth=1.5, label='Loss (Raw)')
+        if len(loss_values) > 5:
+            ma_loss = moving_average(loss_values)
+            ma_steps = steps[len(steps)-len(ma_loss):]
+            plt.plot(ma_steps, ma_loss, color='#e67e22', linewidth=2.5, label='Loss (MA)')
+
+        plt.xlabel('Training Steps', fontsize=12)
+        plt.ylabel('Loss', fontsize=12)
+        plt.title('Training Loss', fontsize=14, pad=20)
+        plt.grid(True, alpha=0.3)
+        plt.legend()
+        pdf.savefig(bbox_inches='tight')
+        plt.close()
+
+        # Plot KL divergence
+        plt.figure(figsize=(12,7))
+        kl_values = [metrics['kl'] for metrics in train_logs.values()]
+
+        plt.plot(steps, kl_values, color='#9b59b6', alpha=0.3, linewidth=1.5, label='KL Divergence (Raw)')
+        if len(kl_values) > 5:
+            ma_kl = moving_average(kl_values)
+            ma_steps = steps[len(steps)-len(ma_kl):]
+            plt.plot(ma_steps, ma_kl, color='#9b59b6', linewidth=2.5, label='KL Divergence (MA)')
+
+        plt.xlabel('Training Steps', fontsize=12)
+        plt.ylabel('KL Divergence', fontsize=12)
+        plt.title('KL Divergence', fontsize=14, pad=20)
         plt.grid(True, alpha=0.3)
         plt.legend()
         pdf.savefig(bbox_inches='tight')
         plt.close()
 
 if __name__ == "__main__":
-    plot_metrics("final")
+    plot_metrics("nodivide")

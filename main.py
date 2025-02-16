@@ -14,7 +14,7 @@ from collections import defaultdict
 import torch
 import torch.nn.functional as F
 import argparse
-from transformers import PreTrainedModel, PreTrainedTokenizerBase
+from transformers import PreTrainedModel, PreTrainedTokenizerBase, GenerationConfig
 
 
 import llms
@@ -98,6 +98,54 @@ def eval_on_test_set(model, tokenizer, test_loader, device, args, round_num):
     return avg_scores, accuracy
 
 
+def selective_log_softmax(logits, index):
+    """
+    A memory-efficient implementation of the common `log_softmax -> gather` operation.
+
+    This function is equivalent to the following naive implementation:
+    ```python
+    logps = torch.gather(logits.log_softmax(-1), dim=-1, index=index.unsqueeze(-1)).squeeze(-1)
+    ```
+
+    Args:
+        logits (`torch.Tensor`):
+            Logits tensor of shape `(..., num_classes)`.
+        index (`torch.Tensor`):
+            Index tensor of shape `(...)`, specifying the positions to gather from the log-softmax output.
+
+    Returns:
+        `torch.Tensor`:
+            Gathered log probabilities with the same shape as `index`.
+    """
+    if logits.dtype in [torch.float32, torch.float64]:
+        selected_logits = torch.gather(logits, dim=-1, index=index.unsqueeze(-1)).squeeze(-1)
+        # loop to reduce peak mem consumption
+        logsumexp_values = torch.stack([torch.logsumexp(lg, dim=-1) for lg in logits])
+        per_token_logps = selected_logits - logsumexp_values  # log_softmax(x_i) = x_i - logsumexp(x)
+    else:
+        # logsumexp approach is unstable with bfloat16, fall back to slightly less efficent approach
+        per_token_logps = []
+        for row_logits, row_labels in zip(logits, index):  # loop to reduce peak mem consumption
+            row_logps = F.log_softmax(row_logits, dim=-1)
+            row_per_token_logps = row_logps.gather(dim=-1, index=row_labels.unsqueeze(-1)).squeeze(-1)
+            per_token_logps.append(row_per_token_logps)
+        per_token_logps = torch.stack(per_token_logps)
+    return per_token_logps
+
+def _get_per_token_logps(model, input_ids, attention_mask, logits_to_keep):
+    # We add 1 to `logits_to_keep` because the last logits of the sequence is later excluded
+    logits = model(input_ids=input_ids, attention_mask=attention_mask, logits_to_keep=logits_to_keep + 1).logits
+    logits = logits[:, :-1, :]  # (B, L-1, V), exclude the last logit: it corresponds to the next token pred
+
+    input_ids = input_ids[:, -logits_to_keep:]
+    # For transformers<=4.48, logits_to_keep argument isn't supported, so here we drop logits ourselves.
+    # See https://github.com/huggingface/trl/issues/2770
+    logits = logits[:, -logits_to_keep:]
+    return selective_log_softmax(logits, input_ids)  #  compute logprobs for the input tokens
+
+
+
+
 def grpo_loss(
         model: PreTrainedModel,
         base_model: PreTrainedModel,
@@ -146,221 +194,338 @@ def grpo_loss(
 
 
     ##### **1. Generate Responses from Model and Base Model**
-    with torch.inference_mode():
+
+    # 1.  Prepare prompt
+    # Setup actual text structure 
+    prompt = [
+        {'role': 'system', 'content': train_loader.system_prompt},
+        {'role': 'user', 'content': question}
+    ]
 
 
-
-        # 1.  Prepare prompt
-        # Setup actual text structure 
-        prompt = [
-            {'role': 'system', 'content': train_loader.system_prompt},
-            {'role': 'user', 'content': question}
-        ]
-
-        # Get text prompt - and prompt ids/mask
-        prompt_text = tokenizer.apply_chat_template(prompt, tokenize=False)
-        prompt_inputs = tokenizer(prompt_text, return_tensors="pt", padding=True, padding_side="left", add_special_tokens=False)
-        prompt_ids, prompt_mask = prompt_inputs["input_ids"], prompt_inputs["attention_mask"]
-        
-        # Log the prompt to file
-        log_file = os.path.join(training_log_dir, f'{round_num}_generations.txt')
-        with open(log_file, 'w') as f:
-            f.write('###### ORIGINAL PROMPT #####\n\n')
-            f.write(prompt_text)
-            f.write('\n\n#### ANS ####\n\n')
-            f.write(answer)
-
-
-        # Truncate prompt to max length and repeat for number of generations
-        prompt_ids = prompt_ids[:, -args.max_prompt_length:]
-        prompt_mask = prompt_mask[:, -args.max_prompt_length:]
-        
-        # Repeat for number of chains/generations
-        prompt_ids = prompt_ids.repeat(args.num_chains, 1)
-        prompt_mask = prompt_mask.repeat(args.num_chains, 1)
-
-
-
-        # Tokenize prompt and send to device
-        inputs = tokenizer(full_prompt, return_tensors="pt", padding=True, truncation=True).to(device)
-
-        # Repeat inputs for multiple answer generations
-        inputs = {k: v.repeat(args.num_chains, 1) for k, v in inputs.items()}
-
-        # Generate responses from the model (fine-tuned)
-        outputs = model.generate(
-            **inputs, max_length=args.max_completion_length, temperature=0.9, do_sample=True,
-            pad_token_id=tokenizer.eos_token_id
-        )
-
-        # Decode responses and remove the original prompt from outputs
-        responses = [tokenizer.decode(o, skip_special_tokens=True)[len(full_prompt):] for o in outputs]
-
-
-    ##### **2. Compute Rewards & Normalize Advantages**
-    all_scores = []
-    for response in responses:
-        total_score, metrics = evaluator.evaluate_answer(question, response, answer)
-        all_scores.append(total_score)
-
-        # Log scores for this response
-        with open(log_file, 'a') as f:
-            f.write(f"\n#### GENERATION {len(all_scores)} RESPONSE ####\n\n")
-            f.write(response)
-            f.write(f"\n\n#### GENERATION {len(all_scores)} SCORES ####\n")
-            f.write(f"Total Score: {total_score}\n")
-            for k, v in metrics.items():
-                f.write(f"{k}: {v}\n")
-
-        # Accumulate total metrics for logging
-        for k, v in metrics.items():
-            total_metrics[k] += v
-        total_metrics["total_score"] += total_score
-
-        # Track correctness
-        if metrics['correctness'] == 2.0:
-            num_correct += 1
+    # Get text prompt - and prompt ids/mask
+    prompt_text = tokenizer.apply_chat_template(prompt, tokenize=False)
+    prompt_inputs = tokenizer(prompt_text, return_tensors="pt", padding=True, padding_side="left", add_special_tokens=False)
+    prompt_ids, prompt_mask = prompt_inputs["input_ids"], prompt_inputs["attention_mask"]
     
-    # Average the accumulated metrics
-    for k in total_metrics:
-        total_metrics[k] /= len(responses)
-    # Add metrics counts to total metrics
-    total_metrics["num_correct"] = num_correct
-    total_metrics["num_total"] = len(responses)
-    total_metrics["accuracy"] = num_correct / len(responses) if len(responses) > 0 else 0
+    # Log the prompt to file
+    log_file = os.path.join(training_log_dir, f'{round_num}_generations.txt')
+    with open(log_file, 'w') as f:
+        f.write('###### ORIGINAL PROMPT #####\n\n')
+        f.write(prompt_text)
+        f.write('\n\n#### ANS ####\n\n')
+        f.write(answer)
 
 
-
-    # Convert all scores to tensor and normalize advantage
-    all_scores = torch.tensor(all_scores, device=device)
-    with open(log_file, 'a') as f:
-        f.write("\n#### SCORES ####\n")
-        f.write(f"{all_scores}\n")
-
-    mean_rewards = all_scores.view(-1, args.num_chains).mean(dim=1, keepdim=True)
-    with open(log_file, 'a') as f:
-        f.write("\n#### MEAN REWARDS ####\n")
-        f.write(f"{mean_rewards}\n")
-
-    std_rewards = all_scores.view(-1, args.num_chains).std(dim=1, keepdim=True)
-    with open(log_file, 'a') as f:
-        f.write("\n#### STD REWARDS ####\n")
-        f.write(f"{std_rewards}\n")
-
-    advantage = (all_scores - mean_rewards) / (std_rewards + 1e-4)
-    with open(log_file, 'a') as f:
-        f.write("\n#### ADVANTAGE ####\n")
-        f.write(f"{advantage}\n")
-
-    print(f"Raw rewards range: {all_scores.min().item():.3f} to {all_scores.max().item():.3f}")
-    print(f"Advantage range: {advantage.min().item():.3f} to {advantage.max().item():.3f}")
-
-
-
-    ######################
-    # COMPUTE GRPO LOSS # 
-    #####################
-
-    # 1. Get the tokens from just the prompt  [1 question x question length]
-    prompt_ids = tokenizer(full_prompt, return_tensors="pt").input_ids.to(device)
+    # Truncate prompt to max length and repeat for number of generations
+    prompt_ids = prompt_ids[:, -args.max_prompt_length:]
+    prompt_mask = prompt_mask[:, -args.max_prompt_length:]
     
-    # 2. Get the responses from each generation [N generatation x max(generation_length)] (it is padded so all same length)
-    response_ids = tokenizer(responses, return_tensors="pt", padding=True, truncation=True).input_ids.to(device)
-    logits_to_keep = response_ids.size(1)  # we only need to compute the logits for the completion tokens
+    # Repeat for number of chains/generations
+    prompt_ids = prompt_ids.repeat(args.num_chains, 1)
+    prompt_mask = prompt_mask.repeat(args.num_chains, 1)
 
-    # 3. Combine to be [N generation, prompt_length + response_length]
-    combined_ids = torch.cat([prompt_ids.expand(response_ids.size(0), -1), response_ids], dim=1)
 
-    # 4. Want to calculate a completion mask (because each response is padded - we dont care about padding at the end)
-    # will use it logits producing (to not waste computation) and in computing final loss 
-    is_eos = response_ids == tokenizer.eos_token_id
+    # Move tensors to device
+    prompt_ids = prompt_ids.to(device)
+    prompt_mask = prompt_mask.to(device)
+
+    # Set up generation config
+    generation_config = GenerationConfig(
+        max_new_tokens=args.max_completion_length,
+        do_sample=True, 
+        temperature=args.temperature,
+        pad_token_id=tokenizer.pad_token_id
+    )
+
+    # Generate completions
+    prompt_completion_ids = model.generate(
+        prompt_ids,
+        attention_mask=prompt_mask,
+        generation_config=generation_config
+    )
+
+    # Extract completion ids
+    prompt_length = prompt_ids.size(1)
+    prompt_ids = prompt_completion_ids[:, :prompt_length]
+    completion_ids = prompt_completion_ids[:, prompt_length:]
+
+    # Do masking 
+    is_eos = completion_ids == tokenizer.eos_token_id
     eos_idx = torch.full((is_eos.size(0),), is_eos.size(1), dtype=torch.long, device=device)
     eos_idx[is_eos.any(dim=1)] = is_eos.int().argmax(dim=1)[is_eos.any(dim=1)]
     sequence_indices = torch.arange(is_eos.size(1), device=device).expand(is_eos.size(0), -1)
     completion_mask = (sequence_indices <= eos_idx.unsqueeze(1)).int()
-    prompt_mask = torch.ones((response_ids.size(0), prompt_ids.size(1)), dtype=torch.int, device=device)
-    combined_attention_mask = torch.cat([prompt_mask, completion_mask], dim=1) 
+
+    attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)  
+    logits_to_keep = completion_ids.size(1)  # we only need to compute the logits for the completion tokens
+
+
+    # Get reference models logits 
+    with torch.inference_mode():
+        ref_per_token_logps = _get_per_token_logps(base_model, prompt_completion_ids, attention_mask, logits_to_keep)
+
+    # Decode the generated completions
+    completions_text = tokenizer.batch_decode(completion_ids, skip_special_tokens=True)
+
+    # Now compute rewards
+    rewards_per_func = torch.zeros(len(completions_text), evaluator.NUMBER_OF_FUNCTIONS, device=device)
+    # Format inputs as expected by reward functions
+    mock_prompts = [[{'content': question}]] * len(completions_text)
+    mock_completions = [[{'content': completion}] for completion in completions_text]
+    mock_answer = [answer] * len(completions_text)
+    # Run all reward functions
+    correctness_scores = evaluator.correctness_reward_func(prompts=mock_prompts, completions=mock_completions, answer=mock_answer)
+    int_scores = evaluator.int_reward_func(completions=mock_completions)
+    strict_format_scores = evaluator.strict_format_reward_func(completions=mock_completions)
+    soft_format_scores = evaluator.soft_format_reward_func(completions=mock_completions)
+    xml_count_scores = evaluator.xmlcount_reward_func(completions=mock_completions)
+    # Fill rewards tensor
+    rewards_per_func[:, 0] = torch.tensor(correctness_scores, dtype=torch.float32, device=device)
+    rewards_per_func[:, 1] = torch.tensor(int_scores, dtype=torch.float32, device=device) 
+    rewards_per_func[:, 2] = torch.tensor(strict_format_scores, dtype=torch.float32, device=device)
+    rewards_per_func[:, 3] = torch.tensor(soft_format_scores, dtype=torch.float32, device=device)
+    rewards_per_func[:, 4] = torch.tensor(xml_count_scores, dtype=torch.float32, device=device)
+    rewards = rewards_per_func.sum(dim=1)
+
+    # Compute mean rewards per function for logging
+    reward_per_func = rewards_per_func.mean(0)
+    metrics = {}
+    metrics["rewards/correctness_reward_func"] = reward_per_func[0].item()
+    metrics["rewards/int_reward_func"] = reward_per_func[1].item()
+    metrics["rewards/strict_format_reward_func"] = reward_per_func[2].item()
+    metrics["rewards/soft_format_reward_func"] = reward_per_func[3].item()
+    metrics["rewards/xmlcount_reward_func"] = reward_per_func[4].item()
+    metrics["reward"] = rewards.mean().item()
+
+    # Log individual response scores
+    with open(log_file, 'a') as f:
+        for i, (completion, reward_scores) in enumerate(zip(completions_text, rewards_per_func)):
+            f.write(f"\n#### GENERATION {i+1} RESPONSE ####\n\n")
+            f.write(completion)
+            f.write(f"\n\n#### GENERATION {i+1} SCORES ####\n")
+            f.write(f"Correctness: {reward_scores[0]}\n")
+            f.write(f"Integer format: {reward_scores[1]}\n")
+            f.write(f"Strict format: {reward_scores[2]}\n")
+            f.write(f"Soft format: {reward_scores[3]}\n")
+            f.write(f"XML count: {reward_scores[4]}\n")
+            f.write(f"Total reward: {rewards[i]}\n")
+
+    # Compute advantages 
+    mean_grouped_rewards = rewards.view(-1, args.num_chains).mean(dim=1)
+    std_grouped_rewards = rewards.view(-1, args.num_chains).std(dim=1)
+
+    # Normalize the rewards to compute the advantages
+    mean_grouped_rewards = mean_grouped_rewards.repeat_interleave(args.num_chains, dim=0)
+    std_grouped_rewards = std_grouped_rewards.repeat_interleave(args.num_chains, dim=0)
+
+    advantages = (rewards - mean_grouped_rewards) / (std_grouped_rewards + 1e-4)
+    metrics["reward_std"] = std_grouped_rewards.mean().item()
+
+    # Log summary statistics
+    with open(log_file, 'a') as f:
+        f.write("\n#### SUMMARY STATISTICS ####\n")
+        f.write(f"Mean rewards per group: {mean_grouped_rewards}\n")
+        f.write(f"Std rewards per group: {std_grouped_rewards}\n")
+        f.write(f"Advantages: {advantages}\n")
+
+    ####
+    # NOW COMPUTE LOSS 
+    ####
+
+    #  1. Get training models output 
+    # Get logits for both models
+    input_ids = torch.cat([prompt_ids, completion_ids], dim=1)
+    attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)
+    logits_to_keep = completion_ids.size(1)  # Only compute logits for response tokens
+
+    # Get per-token log probabilities for both models
+    per_token_logps = _get_per_token_logps(model, input_ids, attention_mask, logits_to_keep)
+
+    # Compute KL divergence between model and reference model
+    per_token_kl = torch.exp(ref_per_token_logps - per_token_logps) - (ref_per_token_logps - per_token_logps) - 1
+
+    # Compute loss with advantages
+    per_token_loss = torch.exp(per_token_logps - per_token_logps.detach()) * advantages.unsqueeze(1)
+    per_token_loss = -(per_token_loss - args.kl_weight_beta * per_token_kl)
+    loss = ((per_token_loss * completion_mask).sum(dim=1) / completion_mask.sum(dim=1)).mean()
+
+    # Log metrics
+    response_length = completion_mask.sum(1).float().mean().item()
+    metrics["response_length"] = response_length
+
+    mean_kl = ((per_token_kl * completion_mask).sum(dim=1) / completion_mask.sum(dim=1)).mean()
+    metrics["kl"] = mean_kl.item()
+
+    return loss, metrics
+
+
+
+
+    # ##### **2. Compute Rewards & Normalize Advantages**
+    # all_scores = []
+    # for response in completions_text:
+    #     total_score, metrics = evaluator.evaluate_answer(question, response, answer)
+    #     all_scores.append(total_score)
+
+    #     # Log scores for this response
+    #     with open(log_file, 'a') as f:
+    #         f.write(f"\n#### GENERATION {len(all_scores)} RESPONSE ####\n\n")
+    #         f.write(response)
+    #         f.write(f"\n\n#### GENERATION {len(all_scores)} SCORES ####\n")
+    #         f.write(f"Total Score: {total_score}\n")
+    #         for k, v in metrics.items():
+    #             f.write(f"{k}: {v}\n")
+
+    #     # Accumulate total metrics for logging
+    #     for k, v in metrics.items():
+    #         total_metrics[k] += v
+    #     total_metrics["total_score"] += total_score
+
+    #     # Track correctness
+    #     if metrics['correctness'] == 2.0:
+    #         num_correct += 1
+    
+    # # Average the accumulated metrics
+    # for k in total_metrics:
+    #     total_metrics[k] /= len(responses)
+    # # Add metrics counts to total metrics
+    # total_metrics["num_correct"] = num_correct
+    # total_metrics["num_total"] = len(responses)
+    # total_metrics["accuracy"] = num_correct / len(responses) if len(responses) > 0 else 0
+
+
+
+    # # Convert all scores to tensor and normalize advantage
+    # all_scores = torch.tensor(all_scores, device=device)
+    # with open(log_file, 'a') as f:
+    #     f.write("\n#### SCORES ####\n")
+    #     f.write(f"{all_scores}\n")
+
+    # mean_rewards = all_scores.view(-1, args.num_chains).mean(dim=1, keepdim=True)
+    # with open(log_file, 'a') as f:
+    #     f.write("\n#### MEAN REWARDS ####\n")
+    #     f.write(f"{mean_rewards}\n")
+
+    # std_rewards = all_scores.view(-1, args.num_chains).std(dim=1, keepdim=True)
+    # with open(log_file, 'a') as f:
+    #     f.write("\n#### STD REWARDS ####\n")
+    #     f.write(f"{std_rewards}\n")
+
+    # advantage = (all_scores - mean_rewards) / (std_rewards + 1e-4)
+    # with open(log_file, 'a') as f:
+    #     f.write("\n#### ADVANTAGE ####\n")
+    #     f.write(f"{advantage}\n")
+
+    # print(f"Raw rewards range: {all_scores.min().item():.3f} to {all_scores.max().item():.3f}")
+    # print(f"Advantage range: {advantage.min().item():.3f} to {advantage.max().item():.3f}")
+
+
+
+    # ######################
+    # # COMPUTE GRPO LOSS # 
+    # #####################
+
+    # # 1. Get the tokens from just the prompt  [1 question x question length]
+    # prompt_ids = tokenizer(full_prompt, return_tensors="pt").input_ids.to(device)
+    
+    # # 2. Get the responses from each generation [N generatation x max(generation_length)] (it is padded so all same length)
+    # response_ids = tokenizer(responses, return_tensors="pt", padding=True, truncation=True).input_ids.to(device)
+    # logits_to_keep = response_ids.size(1)  # we only need to compute the logits for the completion tokens
+
+    # # 3. Combine to be [N generation, prompt_length + response_length]
+    # combined_ids = torch.cat([prompt_ids.expand(response_ids.size(0), -1), response_ids], dim=1)
+
+    # # 4. Want to calculate a completion mask (because each response is padded - we dont care about padding at the end)
+    # # will use it logits producing (to not waste computation) and in computing final loss 
+    # is_eos = response_ids == tokenizer.eos_token_id
+    # eos_idx = torch.full((is_eos.size(0),), is_eos.size(1), dtype=torch.long, device=device)
+    # eos_idx[is_eos.any(dim=1)] = is_eos.int().argmax(dim=1)[is_eos.any(dim=1)]
+    # sequence_indices = torch.arange(is_eos.size(1), device=device).expand(is_eos.size(0), -1)
+    # completion_mask = (sequence_indices <= eos_idx.unsqueeze(1)).int()
+    # prompt_mask = torch.ones((response_ids.size(0), prompt_ids.size(1)), dtype=torch.int, device=device)
+    # combined_attention_mask = torch.cat([prompt_mask, completion_mask], dim=1) 
 
     
-    # # 5. Get logits of model - trim to just be responses 
+    # # # 5. Get logits of model - trim to just be responses 
+    # # logits = model(input_ids=combined_ids, attention_mask=combined_attention_mask).logits 
+    # # logits = logits[:, prompt_ids.size(1):, :]
+
+    # # # 6. Calculate per token log probabilities 
+    # # per_token_logps = []
+    # # for logits_row, input_ids_row in zip(logits, combined_ids[:, -logits_to_keep:]):
+    # #     log_probs = logits_row.log_softmax(dim=-1)
+    # #     token_log_prob = torch.gather(log_probs, dim=1, index=input_ids_row.unsqueeze(1)).squeeze(1)
+    # #     per_token_logps.append(token_log_prob)
+    # # training_model_per_token_logps = torch.stack(per_token_logps)
+    # # print(f"Log probs range: {training_model_per_token_logps.min().item():.3f} to {training_model_per_token_logps.max().item():.3f}")
+
+    # # # 7. Now we need to also calculate the per token log probabilites for the refence model 
+    # # # at first will be same model of course - but then will diverge as training model is trained
+    # # with torch.inference_mode():
+    # #     base_logits = base_model(input_ids=combined_ids, attention_mask=combined_attention_mask).logits 
+    # #     base_logits = base_logits[:, prompt_ids.size(1):, :]
+
+    # #     # 5. Calculate log probabilities 
+    # #     per_token_logps = []
+    # #     for logits_row, input_ids_row in zip(base_logits, combined_ids[:, -logits_to_keep:]):
+    # #         log_probs = logits_row.log_softmax(dim=-1)
+    # #         token_log_prob = torch.gather(log_probs, dim=1, index=input_ids_row.unsqueeze(1)).squeeze(1)
+    # #         per_token_logps.append(token_log_prob)
+    # #     ref_model_per_token_logps = torch.stack(per_token_logps)
+
+
     # logits = model(input_ids=combined_ids, attention_mask=combined_attention_mask).logits 
-    # logits = logits[:, prompt_ids.size(1):, :]
+    # logits = logits[:, prompt_ids.size(1):, :]  # Keep only completion logits
 
     # # 6. Calculate per token log probabilities 
     # per_token_logps = []
-    # for logits_row, input_ids_row in zip(logits, combined_ids[:, -logits_to_keep:]):
+    # for logits_row, input_ids_row, mask_row in zip(logits, response_ids, completion_mask):
     #     log_probs = logits_row.log_softmax(dim=-1)
     #     token_log_prob = torch.gather(log_probs, dim=1, index=input_ids_row.unsqueeze(1)).squeeze(1)
+    #     # Apply mask to zero out padding
+    #     token_log_prob = token_log_prob * mask_row
     #     per_token_logps.append(token_log_prob)
     # training_model_per_token_logps = torch.stack(per_token_logps)
-    # print(f"Log probs range: {training_model_per_token_logps.min().item():.3f} to {training_model_per_token_logps.max().item():.3f}")
 
-    # # 7. Now we need to also calculate the per token log probabilites for the refence model 
-    # # at first will be same model of course - but then will diverge as training model is trained
+    # # 7. Now for reference model (same changes)
     # with torch.inference_mode():
     #     base_logits = base_model(input_ids=combined_ids, attention_mask=combined_attention_mask).logits 
     #     base_logits = base_logits[:, prompt_ids.size(1):, :]
 
-    #     # 5. Calculate log probabilities 
     #     per_token_logps = []
-    #     for logits_row, input_ids_row in zip(base_logits, combined_ids[:, -logits_to_keep:]):
+    #     for logits_row, input_ids_row, mask_row in zip(base_logits, response_ids, completion_mask):
     #         log_probs = logits_row.log_softmax(dim=-1)
     #         token_log_prob = torch.gather(log_probs, dim=1, index=input_ids_row.unsqueeze(1)).squeeze(1)
+    #         token_log_prob = token_log_prob * mask_row
     #         per_token_logps.append(token_log_prob)
     #     ref_model_per_token_logps = torch.stack(per_token_logps)
 
-
-    logits = model(input_ids=combined_ids, attention_mask=combined_attention_mask).logits 
-    logits = logits[:, prompt_ids.size(1):, :]  # Keep only completion logits
-
-    # 6. Calculate per token log probabilities 
-    per_token_logps = []
-    for logits_row, input_ids_row, mask_row in zip(logits, response_ids, completion_mask):
-        log_probs = logits_row.log_softmax(dim=-1)
-        token_log_prob = torch.gather(log_probs, dim=1, index=input_ids_row.unsqueeze(1)).squeeze(1)
-        # Apply mask to zero out padding
-        token_log_prob = token_log_prob * mask_row
-        per_token_logps.append(token_log_prob)
-    training_model_per_token_logps = torch.stack(per_token_logps)
-
-    # 7. Now for reference model (same changes)
-    with torch.inference_mode():
-        base_logits = base_model(input_ids=combined_ids, attention_mask=combined_attention_mask).logits 
-        base_logits = base_logits[:, prompt_ids.size(1):, :]
-
-        per_token_logps = []
-        for logits_row, input_ids_row, mask_row in zip(base_logits, response_ids, completion_mask):
-            log_probs = logits_row.log_softmax(dim=-1)
-            token_log_prob = torch.gather(log_probs, dim=1, index=input_ids_row.unsqueeze(1)).squeeze(1)
-            token_log_prob = token_log_prob * mask_row
-            per_token_logps.append(token_log_prob)
-        ref_model_per_token_logps = torch.stack(per_token_logps)
-
-    # 8. Now let compute KL divergence between the live model and the reference model
-    per_token_kl = torch.exp(ref_model_per_token_logps - training_model_per_token_logps) - (ref_model_per_token_logps - training_model_per_token_logps) - 1
-    print(f"KL range: {per_token_kl.min().item():.3f} to {per_token_kl.max().item():.3f}")
+    # # 8. Now let compute KL divergence between the live model and the reference model
+    # per_token_kl = torch.exp(ref_model_per_token_logps - training_model_per_token_logps) - (ref_model_per_token_logps - training_model_per_token_logps) - 1
+    # print(f"KL range: {per_token_kl.min().item():.3f} to {per_token_kl.max().item():.3f}")
     
-    # 9. Now compute the advantage gradient weighted by the per token difference 
-    # Now in this case the model used to generate the tokens is precisly the one we are updated - the ratio will always be 1 
-    # The advantage is currently [1, 16] - we need it to be [16, 609] to match per-token dimensions
-    advantages = advantage.squeeze(0)  # Remove batch dimension to get [16]
-    advantages = advantages.unsqueeze(1).expand(-1, training_model_per_token_logps.size(1))  # Shape: [16, 609]
-    per_token_loss = torch.exp(training_model_per_token_logps - training_model_per_token_logps.detach()) * advantages
-    # 10. Now combine with the weighted kl 
-    per_token_loss = -(per_token_loss - args.kl_weight_beta * per_token_kl)
+    # # 9. Now compute the advantage gradient weighted by the per token difference 
+    # # Now in this case the model used to generate the tokens is precisly the one we are updated - the ratio will always be 1 
+    # # The advantage is currently [1, 16] - we need it to be [16, 609] to match per-token dimensions
+    # advantages = advantage.squeeze(0)  # Remove batch dimension to get [16]
+    # advantages = advantages.unsqueeze(1).expand(-1, training_model_per_token_logps.size(1))  # Shape: [16, 609]
+    # per_token_loss = torch.exp(training_model_per_token_logps - training_model_per_token_logps.detach()) * advantages
+    # # 10. Now combine with the weighted kl 
+    # per_token_loss = -(per_token_loss - args.kl_weight_beta * per_token_kl)
 
-    # 11. Finally mask out the padded tokens and sume 
-    loss = ((per_token_loss * completion_mask).sum(dim=1) / completion_mask.sum(dim=1)).mean()
-    print(f"Per token loss range: {per_token_loss.min().item():.7f} to {per_token_loss.max().item():.7f}")
-    print(f"Final loss: {loss.item():.7f}")
-    #######################
-    # Now just some logs #
-    ######################
-    mean_kl = (((per_token_kl * completion_mask).sum(dim=1) / completion_mask.sum(dim=1)).mean()).mean().item()
-    total_metrics["total_loss"] = loss.item() 
-    total_metrics["mean_kl_loss"] = mean_kl
+    # # 11. Finally mask out the padded tokens and sume 
+    # loss = ((per_token_loss * completion_mask).sum(dim=1) / completion_mask.sum(dim=1)).mean()
+    # print(f"Per token loss range: {per_token_loss.min().item():.7f} to {per_token_loss.max().item():.7f}")
+    # print(f"Final loss: {loss.item():.7f}")
+    # #######################
+    # # Now just some logs #
+    # ######################
+    # mean_kl = (((per_token_kl * completion_mask).sum(dim=1) / completion_mask.sum(dim=1)).mean()).mean().item()
+    # total_metrics["total_loss"] = loss.item() 
+    # total_metrics["mean_kl_loss"] = mean_kl
 
-    return loss, total_metrics
+    # return loss, total_metrics
 
 def parse_args():
     parser = argparse.ArgumentParser(description="GRPO training arguments")
@@ -369,6 +534,7 @@ def parse_args():
     parser.add_argument("--output_dir", type=str, default="output")
     parser.add_argument("--learning_rate", type=float, default=5e-6)
     parser.add_argument("--adam_beta1", type=float, default=0.9)
+    parser.add_argument("--temperature", type=float, default=0.9)
     parser.add_argument("--adam_beta2", type=float, default=0.99)
     parser.add_argument("--weight_decay", type=float, default=0.1)
     parser.add_argument("--warmup_ratio", type=float, default=0.1)
@@ -475,13 +641,18 @@ if __name__ == "__main__":
         total_loss, train_metrics = grpo_loss(model, base_model, tokenizer, question, answer, device, round_num, train_log_dir, args)
         # Add current learning rate to metrics
         train_metrics["learning_rate"] = scheduler.get_last_lr()[0]
+        # Add loss and gradient norm to metrics
+        train_metrics["loss"] = total_loss.item() * args.gradient_accumulation_steps
+        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), float('inf')).item()
+        train_metrics["grad_norm"] = grad_norm
+
         train_metrics_total[round_num] = train_metrics
 
         # Log metrics for this iteration
         with open(os.path.join(train_log_dir, "train_logs.json"), "w") as f:
             json.dump(train_metrics_total, f, indent=4)
         # Gradient accumulation
-        total_loss = total_loss / args.gradient_accumulation_steps
+        total_loss = total_loss# / args.gradient_accumulation_steps
         total_loss.backward()
         accumulated_loss += total_loss.item()
 

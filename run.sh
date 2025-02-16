@@ -1,1 +1,1 @@
-python main.py --output_dir "testing129" --verbose
+python main.py --output_dir "nodivide" --verbose
