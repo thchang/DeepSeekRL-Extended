@@ -56,7 +56,5 @@ I'm really pleased to see how well the key mechanics work even in this simplifie
 
 4. I'd like to do all this experimentation in this framework, so I need to make things faster, and support multi-gpu training.
 
-## Collaboration?
-I have many more experiments I'd love to run but am severely compute-limited. If you're an organization with available compute resources and interest in exploring these directions, I'd be very excited to collaborate! Please reach out to discuss potential experiments. I can be reached at brendan@bhogan.net or on twitter [@brendanh0gan](https://x.com/brendanh0gan). :)
 
 
