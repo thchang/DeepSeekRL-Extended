@@ -434,7 +434,11 @@ if __name__ == "__main__":
     utils.seed_everything(args.seed)
 
     # Set device and enable bf16
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = (
+        "cuda" if torch.cuda.is_available() else
+        "mps" if torch.mps.is_available() else
+        "cpu"
+    )
     torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = True
     torch.set_float32_matmul_precision('high') 
 
